@@ -1,4 +1,3 @@
-var UIRECORDERAPI = 'ws://ui-recorder-server:9765';
 var ENABLE_ICON1 = 'img/icon.png';
 var ENABLE_ICON2 = 'img/icon-record.png';
 var DISABLE_ICON = 'img/icon-disable.png';
@@ -22,56 +21,127 @@ var __ = function(str){
     return str;
 };
 
+// Global events port
+var mapGlobalEvents = {};
+var GlobalEvents = {
+    on: function(type, handler){
+        var arrEvents = mapGlobalEvents[type] || [];
+        arrEvents.push(handler);
+        mapGlobalEvents[type] = arrEvents;
+    },
+    emit: function(type, data){
+        sendGlobalEvents({
+            type: type,
+            data: data
+        });
+    },
+    _emit: function(type, data){
+        var arrEvents = mapGlobalEvents[type] || [];
+        arrEvents.forEach(function(handler){
+            handler(data);
+        });
+    }
+};
+var mapPorts = {};
+var maxPortId = 0;
+chrome.extension.onConnect.addListener(function(port) {
+    var portId = maxPortId++;
+    mapPorts[portId] = port;
+    var tabId = port.sender.tab.id;
+    port.onMessage.addListener(function(msg){
+        sendGlobalEvents(msg, tabId);
+    });
+    port.onDisconnect.addListener(function(port){
+        delete mapPorts[portId];
+    });
+});
+function sendGlobalEvents(msg, senderTabId){
+    GlobalEvents._emit(msg.type, msg.data);
+    var port, tabId;
+    for(var portId in mapPorts){
+        port = mapPorts[portId];
+        tabId = port.sender.tab.id;
+        if(senderTabId !== undefined && senderTabId !== tabId){
+            port = null;
+        }
+        port && port.postMessage(msg);
+    }
+}
+
 // websocket to ui recorder server
-var wsSocket = new WebSocket(UIRECORDERAPI, "protocolOne");
-wsSocket.onopen = function (event) {
-    console.log('ws connected!');
-}
-wsSocket.onmessage = function (message) {
-    message = message.data;
-    try{
-        message = JSON.parse(message);
+var wsSocket;
+function connectServer(port){
+    if(!wsSocket){
+        wsSocket = new WebSocket('ws://127.0.0.1:'+port, "protocolOne");
+        wsSocket.onopen = function (event) {
+            console.log('ws connected!');
+        }
+        wsSocket.onmessage = function (message) {
+            message = message.data;
+            try{
+                message = JSON.parse(message);
+            }
+            catch(e){}
+            var type = message.type;
+            var data = message.data;
+            switch(type){
+                case 'config':
+                    recordConfig = data;
+                    i18n = recordConfig.i18n;
+                    GlobalEvents.emit('updateConfig', recordConfig);
+                    break;
+                case 'checkResult':
+                    chrome.notifications.create({
+                        type: 'basic',
+                        iconUrl: 'img/'+(data.success?'success':'fail')+'.png',
+                        title: data.success?__('exec_succeed'):__('exec_failed'),
+                        message: data.title
+                    });
+                    GlobalEvents.emit('checkResult', data);
+                    break;
+                case 'moduleStart':
+                    isModuleLoading = true;
+                    recordConfig.isModuleLoading = true;
+                    chrome.notifications.create({
+                        type: 'basic',
+                        iconUrl: 'img/warn.png',
+                        title: __('module_start_title'),
+                        message: __('module_start_message', data.file)
+                    });
+                    GlobalEvents.emit('moduleStart');
+                    break;
+                case 'moduleEnd':
+                    isModuleLoading = false;
+                    recordConfig.isModuleLoading = false;
+                    chrome.notifications.create({
+                        type: 'basic',
+                        iconUrl: 'img/'+(data.success?'success':'fail')+'.png',
+                        title: __('module_end_title'),
+                        message: __('module_end_message', data.success?__('succeed'):__('failed'), data.file)
+                    });
+                    GlobalEvents.emit('moduleEnd');
+                    break;
+                case 'mobileAppInfo':
+                    GlobalEvents.emit('mobileAppInfo', data);
+                    break;
+
+            }
+        }
+        wsSocket.onclose = function(){
+            wsSocket = null;
+            console.log('ws closed!');
+        }
     }
-    catch(e){}
-    var type = message.type;
-    var data = message.data;
-    switch(type){
-        case 'config':
-            recordConfig = data;
-            i18n = recordConfig.i18n;
-            break;
-        case 'checkResult':
-            chrome.notifications.create('checkResult', {
-                type: 'basic',
-                iconUrl: 'img/'+(data.success?'success':'fail')+'.png',
-                title: data.success?__('check_succeed'):__('check_failed'),
-                message: data.title
-            });
-            break;
-        case 'moduleStart':
-            isModuleLoading = true;
-            chrome.notifications.create('moduleStart', {
-                type: 'basic',
-                iconUrl: 'img/warn.png',
-                title: __('module_start_title'),
-                message: __('module_start_message', data.file)
-            });
-            break;
-        case 'moduleEnd':
-            isModuleLoading = false;
-            chrome.notifications.create('moduleEnd', {
-                type: 'basic',
-                iconUrl: 'img/'+(data.success?'success':'fail')+'.png',
-                title: __('module_end_title'),
-                message: __('module_end_message', data.success?__('succeed'):__('failed'), data.file)
-            });
-            break;
-    }
 }
-wsSocket.onclose = function(){
-    wsSocket = null;
-    console.log('ws closed!');
-}
+
+GlobalEvents.on('updatePathAttr', function(newAttr){
+    var arrPathAttrs = recordConfig.pathAttrs;
+    arrPathAttrs.forEach(function(attr){
+        if(attr.name === newAttr.name){
+            attr.on = newAttr.on;
+        }
+    });
+});
 
 function sendWsMessage(type, data){
     if(wsSocket){
@@ -102,10 +172,10 @@ function setRecorderWork(enable){
 }
 
 var arrTasks = [];
-var lastWindow = null;
+var lastWindow = -1;
 var allKeyMap = {};
 var allMouseMap = {};
-var beforeUnloadCmdInfo = null;
+
 // save recoreded command
 function saveCommand(windowId, frame, cmd, data){
     if(isModuleLoading){
@@ -118,6 +188,8 @@ function saveCommand(windowId, frame, cmd, data){
         data: data,
         fix: false
     };
+
+    checkLostKey(windowId);
 
     switch(cmd){
         case 'keyDown':
@@ -132,23 +204,7 @@ function saveCommand(windowId, frame, cmd, data){
         case 'mouseUp':
             delete allMouseMap[data.button];
             break;
-        case 'beforeUnload':
-            cmdInfo.cmd = 'acceptAlert';
-            beforeUnloadCmdInfo = cmdInfo;
-            return;
-            break;
-        case 'cancelBeforeUnload':
-            beforeUnloadCmdInfo = null;
-            cmdInfo.cmd = 'dismissAlert';
-            break;
     }
-
-    if(beforeUnloadCmdInfo){
-        execNextCommand(beforeUnloadCmdInfo);
-        beforeUnloadCmdInfo = null;
-    }
-
-    checkLostKey(windowId);
 
     execNextCommand(cmdInfo);
 }
@@ -156,29 +212,31 @@ function saveCommand(windowId, frame, cmd, data){
 // 补足丢失的事件
 function checkLostKey(windowId){
     if(windowId !== lastWindow){
-        var cmdInfo;
-        for(var key in allKeyMap){
-            cmdInfo = allKeyMap[key];
-            execNextCommand({
-                window: cmdInfo.window,
-                frame: cmdInfo.frame,
-                cmd: 'keyUp',
-                data: cmdInfo.data,
-                fix: true
-            });
+        if(lastWindow !== -1){
+            var cmdInfo;
+            for(var key in allKeyMap){
+                cmdInfo = allKeyMap[key];
+                execNextCommand({
+                    window: cmdInfo.window,
+                    frame: cmdInfo.frame,
+                    cmd: 'keyUp',
+                    data: cmdInfo.data,
+                    fix: true
+                });
+            }
+            allKeyMap = {};
+            for(var button in allMouseMap){
+                cmdInfo = allMouseMap[button];
+                execNextCommand({
+                    window: cmdInfo.window,
+                    frame: cmdInfo.frame,
+                    cmd: 'mouseUp',
+                    data: cmdInfo.data,
+                    fix: true
+                });
+            }
+            allMouseMap = {};
         }
-        allKeyMap = {};
-        for(var button in allMouseMap){
-            cmdInfo = allMouseMap[button];
-            execNextCommand({
-                window: cmdInfo.window,
-                frame: cmdInfo.frame,
-                cmd: 'mouseUp',
-                data: cmdInfo.data,
-                fix: true
-            });
-        }
-        allMouseMap = {};
         lastWindow = windowId;
     }
 }
@@ -227,7 +285,7 @@ function delWindowId(tabId){
 
 // catch incognito window
 chrome.tabs.onUpdated.addListener(function(tabId, changeInfo, tab) {
-    if (!tab.incognito && isWorking) {
+    if (!tab.incognito && isWorking && /^chrome:\/\//.test(tab.url) === false) {
         var windowId = getWindowId(tabId);
         if(windowId === -1){
             windowId = addWindowId(tabId);
@@ -244,9 +302,7 @@ chrome.webNavigation.onCommitted.addListener(function(navInfo){
         var windowId = getWindowId(tabId);
         if(windowId !== -1 && /^(typed|reload|auto_bookmark)$/.test(type) && /^https?:\/\//.test(url)){
             checkLostKey(-1);
-            saveCommand(windowId, null, 'url', {
-                url: url
-            });
+            saveCommand(windowId, null, 'url', url);
         }
     }
 });
@@ -271,24 +327,26 @@ chrome.runtime.onMessage.addListener(function (request, sender, sendResponse) {
         var tabId = sender.tab.id;
         var windowId = getWindowId(tabId);
         if(windowId !== -1){
-            chrome.tabs.query({currentWindow: true, active: true}, function(tabs){
-                if(tabs.length > 0 && tabId === tabs[0].id){
-                    var type = request.type;
-                    var data = request.data;
-                    switch(type){
-                        case 'end':
-                            endRecorder();
-                            break;
-                        case 'getConfig':
-                            sendResponse(recordConfig);
-                            break;
-                        case 'command':
-                            saveCommand(windowId, data.frame, data.cmd, data.data);
-                            break;
+            var type = request.type;
+            var data = request.data;
+            switch(type){
+                case 'initBackService':
+                    connectServer(data.port);
+                    break;
+                case 'save':
+                    endRecorder(true);
+                    break;
+                case 'end':
+                    endRecorder();
+                    break;
+                case 'getConfig':
+                    sendResponse(recordConfig);
+                    break;
+                case 'command':
+                    saveCommand(windowId, data.frame, data.cmd, data.data);
+                    break;
 
-                    }
-                }
-            });
+            }
             return true;
         }
     }
@@ -304,27 +362,16 @@ chrome.browserAction.onClicked.addListener(function(tab){
     }
 });
 
-// end recorder
-function endRecorder(){
-    setRecorderWork(false);
-    sendWsMessage('end');
-}
+// on windows removed
+chrome.windows.onRemoved.addListener(function(){
+    endRecorder();
+})
 
-// Global events port
-var mapPorts = {};
-var maxPortId = 0;
-chrome.extension.onConnect.addListener(function(port) {
-    var portId = maxPortId++;
-    mapPorts[portId] = port;
-    port.onMessage.addListener(function(msg) {
-        for(var portId in mapPorts){
-            mapPorts[portId].postMessage(msg);
-        }
-    });
-    port.onDisconnect.addListener(function(port){
-        delete mapPorts[portId];
-    });
-});
+// end recorder
+function endRecorder(bSaveFile){
+    setRecorderWork(false);
+    sendWsMessage(bSaveFile?'save':'end');
+}
 
 setRecorderWork(true);
 
